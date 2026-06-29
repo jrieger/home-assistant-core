@@ -1,12 +1,11 @@
 """Sensor platform for GPSD integration."""
 
+import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 import logging
-from typing import override
-
-from gps3.agps3threaded import AGPS3mechanism
+from typing import Any, override
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
@@ -28,7 +27,6 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.typing import StateType
-from homeassistant.util import dt as dt_util
 
 from . import GPSDConfigEntry
 from .const import DOMAIN
@@ -45,28 +43,49 @@ DEFAULT_NAME = "GPS"
 _MODE_VALUES = {2: "2d_fix", 3: "3d_fix"}
 
 
-def count_total_satellites_fn(agps_thread: AGPS3mechanism) -> int | None:
-    """Count the number of total satellites."""
-    satellites = agps_thread.data_stream.satellites
-    return None if satellites == "n/a" else len(satellites)
-
-
-def count_used_satellites_fn(agps_thread: AGPS3mechanism) -> int | None:
-    """Count the number of used satellites."""
-    satellites = agps_thread.data_stream.satellites
-    if satellites == "n/a":
+def get_gpsd_mode(data: dict[str, Any]) -> str | None:
+    """Extract and map the GPSD fix mode."""
+    if (mode_val := data.get("mode")) is None:
+        return None
+    try:
+        return _MODE_VALUES.get(int(mode_val))
+    except ValueError, TypeError:
         return None
 
-    return sum(
-        1 for sat in satellites if isinstance(sat, dict) and sat.get("used", False)
-    )
+
+def count_total_satellites_fn(data: dict[str, Any]) -> int | None:
+    """Count the number of total satellites."""
+    satellites = data.get("satellites")
+    if satellites is None:
+        return None
+    try:
+        return len(satellites)
+    except TypeError:
+        return None
+
+
+def count_used_satellites_fn(data: dict[str, Any]) -> int | None:
+    """Count the number of used satellites."""
+    satellites = data.get("satellites")
+    if satellites is None:
+        return None
+
+    try:
+        return sum(
+            1
+            for sat in satellites
+            if getattr(sat, "used", False) is True
+            or (isinstance(sat, dict) and sat.get("used") is True)
+        )
+    except TypeError:
+        return None
 
 
 @dataclass(frozen=True, kw_only=True)
 class GpsdSensorDescription(SensorEntityDescription):
     """Class describing GPSD sensor entities."""
 
-    value_fn: Callable[[AGPS3mechanism], StateType | datetime]
+    value_fn: Callable[[dict[str, Any]], StateType | datetime]
 
 
 SENSOR_TYPES: tuple[GpsdSensorDescription, ...] = (
@@ -77,20 +96,20 @@ SENSOR_TYPES: tuple[GpsdSensorDescription, ...] = (
         entity_category=EntityCategory.DIAGNOSTIC,
         device_class=SensorDeviceClass.ENUM,
         options=list(_MODE_VALUES.values()),
-        value_fn=lambda agps_thread: _MODE_VALUES.get(agps_thread.data_stream.mode),
+        value_fn=get_gpsd_mode,
     ),
     GpsdSensorDescription(
         key=ATTR_LATITUDE,
         translation_key=ATTR_LATITUDE,
         entity_category=EntityCategory.DIAGNOSTIC,
-        value_fn=lambda agps_thread: agps_thread.data_stream.lat,
+        value_fn=lambda data: data.get("lat"),
         entity_registry_enabled_default=False,
     ),
     GpsdSensorDescription(
         key=ATTR_LONGITUDE,
         translation_key=ATTR_LONGITUDE,
         entity_category=EntityCategory.DIAGNOSTIC,
-        value_fn=lambda agps_thread: agps_thread.data_stream.lon,
+        value_fn=lambda data: data.get("lon"),
         entity_registry_enabled_default=False,
     ),
     GpsdSensorDescription(
@@ -99,7 +118,7 @@ SENSOR_TYPES: tuple[GpsdSensorDescription, ...] = (
         entity_category=EntityCategory.DIAGNOSTIC,
         device_class=SensorDeviceClass.DISTANCE,
         native_unit_of_measurement=UnitOfLength.METERS,
-        value_fn=lambda agps_thread: agps_thread.data_stream.alt,
+        value_fn=lambda data: data.get("alt") or data.get("altHAE"),
         suggested_display_precision=2,
         entity_registry_enabled_default=False,
     ),
@@ -108,9 +127,7 @@ SENSOR_TYPES: tuple[GpsdSensorDescription, ...] = (
         translation_key=ATTR_TIME,
         entity_category=EntityCategory.DIAGNOSTIC,
         device_class=SensorDeviceClass.TIMESTAMP,
-        value_fn=lambda agps_thread: dt_util.parse_datetime(
-            agps_thread.data_stream.time
-        ),
+        value_fn=lambda data: data.get("time"),
         entity_registry_enabled_default=False,
     ),
     GpsdSensorDescription(
@@ -119,7 +136,7 @@ SENSOR_TYPES: tuple[GpsdSensorDescription, ...] = (
         entity_category=EntityCategory.DIAGNOSTIC,
         device_class=SensorDeviceClass.SPEED,
         native_unit_of_measurement=UnitOfSpeed.METERS_PER_SECOND,
-        value_fn=lambda agps_thread: agps_thread.data_stream.speed,
+        value_fn=lambda data: data.get("speed"),
         suggested_display_precision=2,
         entity_registry_enabled_default=False,
     ),
@@ -129,7 +146,7 @@ SENSOR_TYPES: tuple[GpsdSensorDescription, ...] = (
         entity_category=EntityCategory.DIAGNOSTIC,
         device_class=SensorDeviceClass.SPEED,
         native_unit_of_measurement=UnitOfSpeed.METERS_PER_SECOND,
-        value_fn=lambda agps_thread: agps_thread.data_stream.climb,
+        value_fn=lambda data: data.get("climb"),
         suggested_display_precision=2,
         entity_registry_enabled_default=False,
     ),
@@ -158,28 +175,44 @@ async def async_setup_entry(
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up the GPSD component."""
-    async_add_entities(
-        [
-            GpsdSensor(
-                config_entry.runtime_data,
-                config_entry.entry_id,
-                description,
-            )
-            for description in SENSOR_TYPES
-        ]
-    )
+    client = config_entry.runtime_data
+    gpsd_data: dict[str, Any] = {}
+
+    entities = [
+        GpsdSensor(gpsd_data, config_entry.entry_id, description)
+        for description in SENSOR_TYPES
+    ]
+    async_add_entities(entities)
+
+    async def _listen_gpsd() -> None:
+        try:
+            async with client:
+                async for response in client:
+                    data = (
+                        response.model_dump()
+                        if hasattr(response, "model_dump")
+                        else dict(response)
+                    )
+                    gpsd_data.update({k: v for k, v in data.items() if v is not None})
+                    for entity in entities:
+                        if entity.hass:
+                            entity.async_write_ha_state()
+        except asyncio.CancelledError:
+            pass
+
+    config_entry.async_create_background_task(hass, _listen_gpsd(), "gpsd_listener")
 
 
 class GpsdSensor(SensorEntity):
     """Representation of a GPS receiver available via GPSD."""
 
     _attr_has_entity_name = True
-
+    _attr_should_poll = False
     entity_description: GpsdSensorDescription
 
     def __init__(
         self,
-        agps_thread: AGPS3mechanism,
+        gpsd_data: dict[str, Any],
         unique_id: str,
         description: GpsdSensorDescription,
     ) -> None:
@@ -190,12 +223,10 @@ class GpsdSensor(SensorEntity):
             entry_type=DeviceEntryType.SERVICE,
         )
         self._attr_unique_id = f"{unique_id}-{self.entity_description.key}"
-
-        self.agps_thread = agps_thread
+        self.gpsd_data = gpsd_data
 
     @property
     @override
     def native_value(self) -> StateType | datetime:
         """Return the state of GPSD."""
-        value = self.entity_description.value_fn(self.agps_thread)
-        return None if value == "n/a" else value
+        return self.entity_description.value_fn(self.gpsd_data)

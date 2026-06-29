@@ -5,6 +5,5 @@
   "config_flow": true,
   "documentation": "https://www.home-assistant.io/integrations/gpsd",
   "iot_class": "local_polling",
-  "loggers": ["gps3"],
-  "requirements": ["gps3==0.33.3"]
+  "requirements": ["gpsd-client-async==2.0.0"]
 }

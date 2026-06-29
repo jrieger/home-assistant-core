@@ -1,9 +1,9 @@
 """Config flow for GPSD integration."""
 
-import socket
+import asyncio
 from typing import Any, override
 
-from gps3.agps3threaded import GPSD_PORT as DEFAULT_PORT, HOST as DEFAULT_HOST
+from gpsd_client_async import GpsdClient
 import voluptuous as vol
 
 from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
@@ -11,6 +11,9 @@ from homeassistant.const import CONF_HOST, CONF_NAME, CONF_PORT
 from homeassistant.helpers import config_validation as cv
 
 from .const import DOMAIN
+
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 2947
 
 STEP_USER_DATA_SCHEMA = vol.Schema(
     {
@@ -25,17 +28,14 @@ class GPSDConfigFlow(ConfigFlow, domain=DOMAIN):
 
     VERSION = 1
 
-    @staticmethod
-    def test_connection(host: str, port: int) -> bool:
+    async def _test_connection(self, host: str, port: int) -> bool:
         """Test socket connection."""
         try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                sock.connect((host, port))
-                sock.shutdown(2)
-        except OSError:
+            async with asyncio.timeout(3):
+                async with GpsdClient(host=host, port=port):
+                    return True
+        except TimeoutError, OSError:
             return False
-        else:
-            return True
 
     @override
     async def async_step_user(
@@ -45,8 +45,8 @@ class GPSDConfigFlow(ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             self._async_abort_entries_match(user_input)
 
-            connected = await self.hass.async_add_executor_job(
-                self.test_connection, user_input[CONF_HOST], user_input[CONF_PORT]
+            connected = await self._test_connection(
+                user_input[CONF_HOST], user_input[CONF_PORT]
             )
 
             if not connected:
